@@ -1,13 +1,56 @@
-use proc_macro2::Span;
-use quote::ToTokens;
-use syn::Token;
-use syn::ext::IdentExt;
-use syn::parse::{Parse, ParseStream, Result as PRes};
-use syn::token::Bracket;
-use syn::{Ident, Type};
-use syn::{braced, bracketed, parenthesized};
+use std::collections::{HashMap, HashSet};
 
+use proc_macro2::{Span, TokenStream as TS2};
+use syn::Ident;
+use syn::parse::{Parse, ParseStream, Result as PRes};
+
+use super::scope::{Context, Scope};
 use super::{AliasScope, Flag};
+use crate::help::read_help;
+use crate::output::AliasGenerator;
+use crate::output::TypeTree;
+use crate::output::{AliasLookup, TokenizedCommand};
+
+pub mod alias;
+pub mod command;
+pub mod transform;
+
+pub use alias::AliasRule;
+pub use command::{CommandRule, ExpandingCommandRule};
+pub use transform::TransformRule;
+
+#[derive(Debug, Default)]
+pub struct RulesUnresolved {
+    alias: Vec<AliasRule>,
+    cmd: Vec<ExpandingCommandRule>,
+    trnsf: Vec<TransformRule>,
+}
+
+impl RulesUnresolved {
+    pub fn commands_resolution(self, root_name: &str, ignore_nc: bool) -> Rules {
+        Rules {
+            alias: self.alias,
+            trnsf: self.trnsf,
+            // WARN too much collect/clone between this bit of code and
+            // the expand method
+            cmd: self
+                .cmd
+                .into_iter()
+                .map(|mut exp| {
+                    exp.resolve_naming_conventions(ignore_nc);
+                    exp.resolve_direct_scopes(root_name);
+
+                    exp.expand()
+                })
+                .flatten()
+                // here we do operations naming conflicts resolutions
+                // here we enforce naming conventions if their flag is on
+                .collect::<HashSet<CommandRule>>()
+                .into_iter()
+                .collect(),
+        }
+    }
+}
 
 #[derive(Debug, Default)]
 pub struct Rules {
@@ -16,7 +59,103 @@ pub struct Rules {
     trnsf: Vec<TransformRule>,
 }
 
-impl Parse for Rules {
+impl Rules {
+    pub fn cmd_ref(&self) -> &[CommandRule] {
+        &self.cmd
+    }
+
+    pub fn cmd_mut(&mut self) -> &mut Vec<CommandRule> {
+        &mut self.cmd
+    }
+
+    pub fn alias_ref(&self) -> &[AliasRule] {
+        &self.alias
+    }
+
+    pub fn alias_mut(&mut self) -> &mut Vec<AliasRule> {
+        &mut self.alias
+    }
+}
+
+impl Rules {
+    #[deprecated]
+    pub fn resolve_operations_naming_conflicts(&mut self) {
+        // take the command rules
+        let mut cmd = std::mem::take(&mut self.cmd);
+        // declare needed variables
+        let mut map: HashMap<u64, Vec<CommandRule>> = HashMap::new();
+        let mut iter = cmd.into_iter();
+
+        // group command rules by scope hash; i.e., by scope op equality
+        while let Some(cr) = iter.next() {
+            let scope_hash = cr.scope_hash();
+            if let Some(ss) = map.get_mut(&scope_hash) {
+                ss.push(cr);
+            } else {
+                map.insert(scope_hash, vec![cr]);
+            }
+        }
+
+        // iterate over scoped groups
+        let mut iter = map.into_values().into_iter();
+        // check context equality
+        // and change op names when required
+        while let Some(group) = iter.next() {
+            group.iter().map(|cr| (cr.space(), cr.op()));
+            // for now we simply stick to checking if all contexts are equal
+            // if so then nothing is done
+            // otherwise we prefix all operations names with their spaces
+            if group.len() == 1 || group.iter().all(|cr| cr.context() == group[0].context()) {
+                self.cmd.extend(group);
+            } else {
+                self.cmd.extend(group.into_iter().map(|mut cr| {
+                    cr.prefix_op();
+                    cr
+                }))
+            }
+        }
+    }
+}
+
+impl Rules {
+    pub fn inject_version_help(&mut self, root_name: &str) {
+        let i = Ident::new(root_name, Span::call_site());
+        self.cmd
+            .extend([CommandRule::help(i.clone()), CommandRule::version(i)]);
+    }
+
+    pub fn alias_generator(&mut self, auto_alias: bool) {
+        if !auto_alias {
+            return;
+        }
+
+        let mut alias = std::mem::take(self.alias_mut());
+        let mut alias_gen = AliasGenerator::new(&mut alias, self.cmd_ref());
+        alias_gen.generate_aliases();
+
+        self.alias = std::mem::take(&mut alias);
+    }
+
+    pub fn cmds_tokenizer(&self) -> Vec<TokenizedCommand> {
+        self.cmd
+            .iter()
+            .map(|cmd| AliasLookup::new(cmd, &self.alias))
+            .map(|al| al.lookup())
+            .collect()
+    }
+
+    pub fn type_tree_renderer(&self, root_name: &str, derives: &[Ident]) -> TS2 {
+        TypeTree::new(self.cmds_tokenizer(), root_name).render(derives)
+    }
+
+    pub fn root_type_help_implementor(&self, root_name: &str) -> TS2 {
+        let toml = read_help();
+
+        TypeTree::new(self.cmds_tokenizer(), root_name).help(toml)
+    }
+}
+
+impl Parse for RulesUnresolved {
     fn parse(stream: ParseStream) -> PRes<Self> {
         let mut alias = vec![];
         let mut cmd = vec![];
@@ -25,7 +164,7 @@ impl Parse for Rules {
             // TODO this could be better handled
             match stream.fork().parse::<Ident>()? {
                 i if i == Ident::new("c", Span::call_site()) => {
-                    cmd.extend(ExpandedCommandRule::parse(stream)?.0)
+                    cmd.push(ExpandingCommandRule::parse(stream)?)
                 }
 
                 i if i == Ident::new("t", Span::call_site()) => {
@@ -43,181 +182,12 @@ impl Parse for Rules {
                 val => {
                     return Err(syn::Error::new(
                         Span::call_site(),
-                        "expected c, t, s, o or f ident",
+                        format!("expected c, t, s, o or f ident, got {}", val),
                     ));
                 }
             }
         }
 
         Ok(Self { alias, cmd, trnsf })
-    }
-}
-
-#[derive(Debug)]
-pub struct AliasRule {
-    scoped: AliasScope,
-    token: Ident,
-    alias: Ident,
-}
-
-impl Parse for AliasRule {
-    fn parse(stream: ParseStream) -> PRes<Self> {
-        let content;
-        let scoped = Ident::parse(stream)?.try_into()?;
-        _ = parenthesized!(content in stream);
-        let token = Ident::parse(&content)?;
-        _ = <Token![=]>::parse(&stream)?;
-        let alias = Ident::parse(&stream)?;
-
-        Ok(Self {
-            token,
-            alias,
-            scoped,
-        })
-    }
-}
-
-#[derive(Debug, Default)]
-pub struct TransformRule {}
-
-impl Parse for TransformRule {
-    fn parse(stream: ParseStream) -> PRes<Self> {
-        todo!()
-    }
-}
-
-#[derive(Debug, Default)]
-pub struct CommandRule {
-    space: Option<Ident>,
-    op: Option<Ident>,
-    flags: Option<Vec<Flag>>,
-    params: Option<Type>,
-}
-
-#[derive(Debug)]
-pub struct ExpandedCommandRule(Vec<CommandRule>);
-
-fn extract_context_tokens(s: ParseStream) -> PRes<(Vec<Flag>, Option<Type>)> {
-    let mut f = vec![];
-    let mut p = None;
-
-    while !s.is_empty() {
-        // flag
-        if s.peek(Ident::peek_any) {
-            f.push(Flag::parse(s)?);
-        // param
-        } else {
-            _ = <Token![<]>::parse(s)?;
-            p = Type::parse(s).ok();
-            _ = <Token![>]>::parse(s)?;
-        }
-    }
-
-    Ok((f, p))
-}
-
-pub fn extract_scope_tokens(s: ParseStream) -> PRes<Vec<Ident>> {
-    // anonymous scope
-    if s.peek(Bracket) {
-        return Ok(vec![]);
-    }
-    // just because next is not a [
-    // doesnt mean it would be an ident
-    // but failing is such a case is intended behaviour
-    let _i = Ident::parse(&s)?;
-
-    let scopes;
-    _ = parenthesized!(scopes in s);
-    // use punctuated instead
-    scopes
-        .parse_terminated(Ident::parse, Token![,])
-        .map(|p| p.into_iter().collect())
-}
-
-impl ExpandedCommandRule {
-    fn new(spaces: Vec<Ident>, ops: Vec<Ident>, flags: Vec<Flag>, params: Option<Type>) -> Self {
-        Self(match [spaces.is_empty(), ops.is_empty()] {
-            [true, true] => vec![CommandRule::default()],
-            [true, false] => ops
-                .into_iter()
-                .map(|o| CommandRule {
-                    op: Some(o),
-                    ..Default::default()
-                })
-                .collect(),
-            [false, true] => spaces
-                .into_iter()
-                .map(|s| CommandRule {
-                    space: Some(s),
-                    ..Default::default()
-                })
-                .collect(),
-            [false, false] => spaces
-                .into_iter()
-                .map(|s| {
-                    ops.iter()
-                        .map(|o| CommandRule {
-                            space: Some(s.clone()),
-                            op: Some(o.clone()),
-                            ..Default::default()
-                        })
-                        .collect::<Vec<CommandRule>>()
-                })
-                .flatten()
-                .map(|mut c| {
-                    c.flags = Some(flags.clone());
-                    c.params = params.clone();
-
-                    c
-                })
-                .collect(),
-        })
-    }
-}
-
-impl Parse for ExpandedCommandRule {
-    fn parse(stream: ParseStream) -> PRes<Self> {
-        let _rule_name = Ident::parse(stream)?;
-
-        let content;
-        _ = braced!(content in stream);
-        // there is some scope
-
-        let spaces = extract_scope_tokens(&content)?;
-        let ops = extract_scope_tokens(&content)?;
-
-        let context;
-        _ = bracketed!(context in content);
-        let (flags, params) = extract_context_tokens(&context)?;
-
-        Ok(ExpandedCommandRule::new(spaces, ops, flags, params))
-    }
-}
-
-impl std::fmt::Display for CommandRule {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{}",
-            format!(
-                "SPACE<{}> OPERATION<{}> PARAM<{}> FLAGS<{}>\n",
-                self.space
-                    .as_ref()
-                    .map(|i| i.to_string())
-                    .unwrap_or("".into()),
-                self.op.as_ref().map(|i| i.to_string()).unwrap_or("".into()),
-                self.params
-                    .as_ref()
-                    .map(|t| format!("{:?}", t.to_token_stream().to_string()))
-                    .unwrap_or("".into()),
-                self.flags
-                    .as_ref()
-                    .map(|f| f
-                        .into_iter()
-                        .map(|f| f.to_string())
-                        .fold(String::new(), |acc, f| acc + &f + " "))
-                    .unwrap_or("".into()),
-            )
-        )
     }
 }

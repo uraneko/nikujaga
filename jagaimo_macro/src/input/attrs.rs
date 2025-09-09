@@ -5,21 +5,8 @@ use syn::parse::{Parse, ParseStream, Result as PRes};
 use syn::{Ident, Lit};
 use syn::{bracketed, parenthesized};
 
-use crate::resolve_crate::ResolveCrate;
-
-pub fn enforce_nc(name: &mut String) {
-    name.replace_range(
-        0..1,
-        &name.get(0..1).map(|s| s.to_ascii_uppercase()).unwrap(),
-    );
-
-    while let Some(idx) = name.find('_') {
-        let next = name.get(idx + 1..idx + 2);
-        if let Some(s) = next {
-            name.replace_range(idx..idx + 2, &s.to_ascii_uppercase());
-        }
-    }
-}
+use super::enforce_str_nc;
+use resolve_calling_crate::ResolveCrate;
 
 #[derive(Debug)]
 pub struct Attrs {
@@ -31,6 +18,40 @@ pub struct Attrs {
     ignore_naming_conventions: bool,
     auto_alias: bool,
     derives: Vec<Ident>,
+}
+
+impl Attrs {
+    pub fn derives(&self) -> &[Ident] {
+        &self.derives
+    }
+
+    pub fn fish_cmp(&self) -> bool {
+        self.fish_completions
+    }
+
+    pub fn nu_cmp(&self) -> bool {
+        self.nu_completions
+    }
+
+    pub fn root_name(&self) -> &str {
+        &self.root_name
+    }
+
+    pub fn auto_alias(&self) -> bool {
+        self.auto_alias
+    }
+
+    pub fn help(&self) -> bool {
+        self.help
+    }
+
+    pub fn version(&self) -> bool {
+        self.version
+    }
+
+    pub fn ignore_nc(&self) -> bool {
+        self.ignore_naming_conventions
+    }
 }
 
 impl Default for Attrs {
@@ -114,7 +135,7 @@ impl Parse for Attrs {
         // TODO dont capitalize any type name when this flag is on
         if !attrs.ignore_naming_conventions {
             // TODO all type tree type idents need this
-            enforce_nc(&mut attrs.root_name);
+            enforce_str_nc(&mut attrs.root_name);
         }
 
         Ok(attrs)

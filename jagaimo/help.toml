@@ -1,7 +1,17 @@
+# the root space is denoted with `root`
+# to write an item that should be applied for all spaces or operations 
+# that have it, use an underscore `_`
+
+# flags cant have descriptions 
+# only spaces and ops can 
 [descriptions]
 root = "brief description of the cli tool"
 history = "then another for the history space"
-all.add = "description for the add operation when it is called from any space, including root"
+# description of every add operation no matter the space 
+_.add = "description for the add operation when it is called from any space, including root"
+# unless another description was specified for a particular space's add op
+collections.add = """specific add operation description for the collections space, 
+superseeds the default _.add description"""
 
 [links]
 root.issues = "https://www.github.com/uraneko/jagaimo/issues"
@@ -9,12 +19,14 @@ root.repo = "https://www.github.com/uraneko/jagaimo"
 root.website = "???"
 collections.issues = "https://www.github.com/uraneko/jagaimo/issues"
 root.github = "https://www.github.com/uraneko"
+hosts.view.hosting = "https://github.com/"
+hosts.view.source = "https://gitlab.com/"
 
 [spaces]
 collections = "operations for managing collections"
 history = "history operations"
 
-[operations]
+[ops]
 root.add = "create a new item and add it to existing group"
 
 # this superseed the above general description for the add ope when the space is collections 
@@ -26,5 +38,9 @@ history.view = "view all the history registries"
 [flags]
 root.size = "specify the size of the item"
 
+_.max = "declare the maximum number of items allowed"
+
 # this specific rule supersedes any other limit flag rule for command history query --limit
 history.query.limit = "sets the limit of the history query results count"
+
+history.delimiter = "yadayadayadayada"
